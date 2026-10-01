@@ -124,6 +124,23 @@ class DeactivationRequest(DeadlockRequest):
 GuaranteeRequest = DeadlockRequest
 
 
+class VersionedActionRequest(BaseModel):
+    """Body of every session mutation: optimistic concurrency via version."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: Annotated[int, Field(ge=0)]
+
+
+class ReplaceProtocolRequest(BaseModel):
+    """Full protocol replacement; the existing protocol validation is reused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: Annotated[int, Field(ge=0)]
+    protocol: DeadlockRequest
+
+
 class StateView(BaseModel):
     A: StateId
     B: StateId
@@ -197,3 +214,30 @@ class GuaranteeResponse(BaseModel):
     visited_states: int
     initial: ConfigurationView
     witness: GuaranteeWitness | None = None
+
+
+class SessionView(BaseModel):
+    """Immutable snapshot of a drill session at one version."""
+
+    session_id: str
+    version: int
+    completed: bool
+    protocol: DeadlockRequest
+    configuration: ConfigurationView
+    trace: list[PathStep]
+    enabled_transition_ids: list[str]
+
+
+class CreatedSessionView(SessionView):
+    pass
+
+
+class SessionError(Exception):
+    """Mapped by the API layer to 404/409/422 responses."""
+
+    def __init__(self, status_code: int, code: str, message: str, details: dict | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        self.details = details or {}

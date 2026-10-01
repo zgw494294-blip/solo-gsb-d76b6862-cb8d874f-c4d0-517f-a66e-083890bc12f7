@@ -544,6 +544,153 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 }
 ```
 
+## 双端协议演练：有状态会话
+
+除离线分析外，服务还支持对协议做交互式演练：会话保留完整执行轨迹，修改协议后可在新协议下从初态重放历史轨迹并继续执行。会话只保存在**单进程内存**中，重启服务后全部清空；不依赖数据库或外部存储。
+
+- `POST /v1/sessions`：用与死锁分析完全相同的协议创建会话。
+- `GET /v1/sessions/{session_id}`：查询会话当前快照。
+- `POST /v1/sessions/{session_id}/transitions/{transition_id}`：执行一个转移（按 ID）。
+- `PUT /v1/sessions/{session_id}/protocol`：替换完整协议并重放已执行轨迹。
+
+每次修改（执行转移或替换协议）都必须在请求体携带 `expected_version`，其值须等于会话当前版本；修改成功后版本号加 1。过期版本返回 `409 Conflict`，同版本并发修改只有一项成功。协议、当前配置、轨迹与版本在同一次原子提交中同时生效；任何失败都保持旧会话不变，查询始终返回同一版本的一致快照。
+
+会话快照字段：
+
+- `session_id`：会话 ID；
+- `version`：当前版本，创建时为 `0`；
+- `completed`：当前配置是否已完成（两端终态且队列均空）；
+- `protocol`：当前生效的完整协议；
+- `configuration`：当前两端状态与两个队列；
+- `trace`：执行轨迹，每步含从 1 开始的 `index`、`transition_id`、`from`/`to`、`action`、`message` 以及执行后的 `state` 与 `queues`；
+- `enabled_transition_ids`：当前配置下可执行的转移 ID，按 ID 升序。
+
+### 1. 创建会话：`POST /v1/sessions`
+
+```bash
+curl -X POST http://localhost:8000/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "transitions": [
+      { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+      { "id": "t2", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+    ]
+  }'
+```
+
+返回 `201 Created`，`version` 为 `0`，轨迹为空，可执行转移为 `["t1"]`：
+
+```json
+{
+  "session_id": "9f3c…",
+  "version": 0,
+  "completed": false,
+  "protocol": { "…": "与请求一致的完整协议" },
+  "configuration": {
+    "state": { "A": 0, "B": 0 },
+    "queues": { "A_to_B": null, "B_to_A": null }
+  },
+  "trace": [],
+  "enabled_transition_ids": ["t1"]
+}
+```
+
+协议非法时复用原校验，返回 `422`（详见下文“请求校验与 422”）。
+
+### 2. 查询快照：`GET /v1/sessions/{session_id}`
+
+```bash
+curl http://localhost:8000/v1/sessions/9f3c…
+```
+
+返回与创建/修改后完全相同结构的当前版本快照。未知会话返回 `404 Not Found`。
+
+### 3. 执行单个转移：`POST /v1/sessions/{id}/transitions/{transition_id}`
+
+```bash
+curl -X POST http://localhost:8000/v1/sessions/9f3c…/transitions/t1 \
+  -H 'Content-Type: application/json' \
+  -d '{ "expected_version": 0 }'
+```
+
+成功后版本加 1，轨迹追加该步（含执行后状态与队列），并给出新的可执行转移列表：
+
+```json
+{
+  "session_id": "9f3c…",
+  "version": 1,
+  "completed": false,
+  "configuration": {
+    "state": { "A": 1, "B": 0 },
+    "queues": { "A_to_B": "m", "B_to_A": null }
+  },
+  "trace": [
+    {
+      "index": 1,
+      "transition_id": "t1",
+      "from": "A", "to": "B", "action": "send", "message": "m",
+      "state": { "A": 1, "B": 0 },
+      "queues": { "A_to_B": "m", "B_to_A": null }
+    }
+  ],
+  "enabled_transition_ids": ["t2"]
+}
+```
+
+- 当前配置下该转移不可执行（含未知转移 ID）：`409 Conflict`，错误体的 `enabled_transition_ids` 列出当前真正可执行的 ID；
+- `expected_version` 过期：`409 Conflict`，错误体带 `current_version`；
+- 会话已处于完成配置时不能继续执行任何转移：`409 Conflict`。
+
+### 4. 替换完整协议并重放轨迹：`PUT /v1/sessions/{id}/protocol`
+
+请求体为 `expected_version` 加完整的新 `protocol`。服务从新协议的初态开始，按轨迹中的已执行 ID 依次重放：允许改变同名转移的定义（消息、方向、端点、起止状态等），但每一步在重放时都必须可执行，且轨迹结束前不能到达完成配置（完成配置不再扩展）。重放成功后同时提交新协议、新轨迹、重算出的当前配置并将版本加 1。
+
+```bash
+curl -X PUT http://localhost:8000/v1/sessions/9f3c…/protocol \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_version": 1,
+    "protocol": {
+      "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+      "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+      "transitions": [
+        { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "n", "source": 0, "target": 1 },
+        { "id": "t2", "from": "A", "to": "B", "action": "receive", "message": "n", "source": 0, "target": 1 }
+      ]
+    }
+  }'
+```
+
+上例把消息 `m` 改名 `n`；历史步 `t1` 在新协议下仍可执行，返回版本 `2`，轨迹重算为携带新定义（`message` 变为 `n`、队列为 `n`）的一步，可继续对版本 `2` 执行 `t2`。
+
+任一步重放失败时返回 `422 Unprocessable Entity`，错误体给出从 1 开始计数的首个失败步：
+
+```json
+{
+  "detail": {
+    "code": "replay_failed",
+    "message": "the executed trace cannot be replayed under the replacement protocol: step 2 (transition 't2') is not fireable before the end of the trace",
+    "failed_step": 2,
+    "transition_id": "t2"
+  }
+}
+```
+
+重放失败（包括轨迹结束前已完成、某 ID 在新协议中消失或不可执行）以及新协议本身非法（`422` 校验）时，会话保持旧协议、旧轨迹与旧版本不变；随后查询仍返回旧版本快照。`expected_version` 过期同样返回 `409`，且与另一修改并发时同版本只有一方成功。
+
+### 会话错误码一览
+
+| 场景 | 状态码 | `detail.code` |
+| --- | --- | --- |
+| 会话 ID 未知（查询/执行/替换） | `404` | `session_not_found` |
+| 创建/替换的协议非法 | `422` | （请求校验错误） |
+| 轨迹无法在新协议下重放 | `422` | `replay_failed`（带 `failed_step`、`transition_id`） |
+| `expected_version` 过期 | `409` | `version_conflict`（带 `current_version`） |
+| 转移当前不可执行或未知 | `409` | `transition_not_enabled`（带 `enabled_transition_ids`） |
+| 已完成会话继续执行 | `409` | `session_completed` |
+
 ## 请求校验与 422
 
 以下情况返回 HTTP `422 Unprocessable Entity`：
@@ -572,6 +719,8 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 - `removable_transition_ids` 中包含重复 ID；
 - `removable_transition_ids` 数量超过 8（或包含空 ID）。
 
+`POST /v1/sessions` 创建会话与 `PUT /v1/sessions/{id}/protocol` 替换协议直接复用上述协议校验：非法协议返回 `422`，且替换失败时不改变会话。会话修改请求缺少 `expected_version`、出现未定义字段等同样返回 `422`；`expected_version` 不匹配、转移不可执行、已完成会话继续执行属于冲突，返回 `409`。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -589,9 +738,11 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 │   ├── __init__.py
 │   ├── analyzer.py
 │   ├── main.py
-│   └── schemas.py
+│   ├── schemas.py
+│   └── sessions.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── README.md
-└── requirements.txt
+├── requirements.txt
+└── test_sessions.py
 ```
