@@ -197,3 +197,37 @@ class GuaranteeResponse(BaseModel):
     visited_states: int
     initial: ConfigurationView
     witness: GuaranteeWitness | None = None
+
+
+# ---------------------------------------------------------------------------
+# Stateful protocol-drill sessions
+# ---------------------------------------------------------------------------
+
+
+# A session is created with exactly the same protocol payload as the offline
+# analysis endpoints, so their validation (unique ids, state references, message
+# limits, ...) is reused unchanged.
+SessionCreateRequest = DeadlockRequest
+
+
+class ExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    transition_id: NonEmptyId
+    expected_version: Annotated[int, Field(ge=0)]
+
+
+class ProtocolReplaceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    protocol: DeadlockRequest
+    expected_version: Annotated[int, Field(ge=0)]
+
+
+class SessionView(BaseModel):
+    id: str
+    version: int
+    protocol: DeadlockRequest
+    configuration: ConfigurationView
+    trace: list[PathStep]
+    enabled_transition_ids: list[str]

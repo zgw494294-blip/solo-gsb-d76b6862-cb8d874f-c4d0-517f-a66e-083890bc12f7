@@ -572,6 +572,112 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 - `removable_transition_ids` 中包含重复 ID；
 - `removable_transition_ids` 数量超过 8（或包含空 ID）。
 
+## 双端协议演练会话
+
+除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练。
+
+- 会话只保存在**单进程内存**中，进程重启即清空，不使用数据库或外部存储。
+- 每次成功执行转移或替换协议，会话 `version` 加 1（创建时为 `0`）。
+- 修改类请求必须携带 `expected_version`：与当前版本不一致返回 `409`；同一版本的并发修改在会话锁保护下只有一项成功，其余返回 `409`。
+- 协议、当前配置、轨迹与版本的更新在同一个锁内一次完成；任何失败都保持旧会话不变，随后查询仍返回同一版本快照。
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/v1/sessions` | 用现有协议请求体（与 `/v1/deadlocks` 完全一致）创建会话，返回会话 ID 与版本 0 |
+| `GET` | `/v1/sessions/{id}` | 查询会话快照 |
+| `POST` | `/v1/sessions/{id}/transitions` | 执行单个转移，请求体 `{"transition_id": ..., "expected_version": ...}` |
+| `PUT` | `/v1/sessions/{id}/protocol` | 替换完整协议，请求体 `{"protocol": {...}, "expected_version": ...}` |
+
+响应均为同一会话视图：
+
+- `id`：会话 ID；
+- `version`：当前版本（创建为 0，每次成功修改加 1）；
+- `protocol`：当前完整协议（与创建请求一致）；
+- `configuration`：当前两端状态与两个队列；
+- `trace`：完整执行轨迹，每步含 `index`（从 1 计）、`transition_id`、`from`、`to`、`action`、`message` 及执行后的状态与队列；
+- `enabled_transition_ids`：当前配置下可执行转移的 ID，按 ID 升序；完成配置下为 `[]`。
+
+状态码：
+
+- 成功：创建 `201`，执行/替换/查询 `200`；
+- `404`：未知会话；
+- `409`：`expected_version` 过期、转移在当前配置下不可执行（含 ID 不存在）、或会话已处于完成配置；
+- `422`：请求体不合法（复用原协议校验，规则同下节）；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步。
+
+替换协议允许改变已有 ID 的转移定义（端点状态、消息、source/target 等），但重放时每一步都必须在新协议下可执行，且不能在轨迹结束前到达完成配置；重放成功后轨迹与当前配置全部按新协议重算。完成配置只禁止继续执行转移，不禁止替换协议。
+
+### 可执行调用示例（端口 8000）
+
+创建会话：
+
+```bash
+SID=$(curl -s -X POST http://localhost:8000/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+    "transitions": [
+      { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+      { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+    ]
+  }' | python3 -c 'import sys, json; print(json.load(sys.stdin)["id"])')
+echo "$SID"
+```
+
+返回 `201`，`version` 为 `0`、`trace` 为 `[]`、`enabled_transition_ids` 为 `["t1"]`。
+
+执行 `t1`（携带当前版本 0）：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t1", "expected_version": 0}'
+```
+
+返回 `200`，`version` 变为 `1`，轨迹含一步，当前队列 `A_to_B` 为 `"m"`，可执行转移变为 `["t4"]`。若重复用 `"expected_version": 0`，返回 `409`。
+
+执行 `t4` 后协议完成（两端终态、队列均空），可执行转移为 `[]`；之后再执行任何转移都返回 `409`：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sessions/$SID/transitions \
+  -H 'Content-Type: application/json' \
+  -d '{"transition_id": "t4", "expected_version": 1}'
+```
+
+查询会话（始终返回同一版本的完整快照，包括协议、配置、轨迹与可执行 ID）：
+
+```bash
+curl -s http://localhost:8000/v1/sessions/$SID
+```
+
+替换协议：把 `t1` 改为在 A 端自环（0→0），已执行轨迹 `t1, t4` 从新初态重放，当前配置被重算（此时 A=0、B=1，尚未完成，可用新协议继续演练）：
+
+```bash
+curl -s -X PUT http://localhost:8000/v1/sessions/$SID/protocol \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_version": 2,
+    "protocol": {
+      "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+      "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+      "transitions": [
+        { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 0 },
+        { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+      ]
+    }
+  }'
+```
+
+成功返回 `200`，`version` 变为 `3`，轨迹仍是两步（按新定义重算状态）。若新协议使第 2 步不可执行（例如把 `t4` 的 `message` 改为 `"ZZ"`），返回 `422`：
+
+```json
+{ "detail": { "error": "replay_failed", "first_failed_step": 2, "reason": "transition 't4' is not enabled" } }
+```
+
+此时会话保持旧协议与版本 `3` 不变。用过期版本（如 `"expected_version": 2`）替换返回 `409`；查询不存在的会话 ID 返回 `404`。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -589,7 +695,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 │   ├── __init__.py
 │   ├── analyzer.py
 │   ├── main.py
-│   └── schemas.py
+│   ├── schemas.py
+│   └── sessions.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── README.md
